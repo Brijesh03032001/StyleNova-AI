@@ -1,8 +1,6 @@
 <div align="center">
 
-<!-- Replace the placeholder below once your banner image is ready -->
-<!-- ![StyleNova AI Banner](public/images/banner.png) -->
-> 📌 **Add your banner:** place `banner.png` in `public/images/` and replace this line with `![StyleNova AI Banner](public/images/banner.png)`
+![StyleNova AI Banner](public/images/styleNova.png)
 
 # StyleNova AI
 ### Vision-Language AI · Adaptive Recommendation · Full-Stack ML System
