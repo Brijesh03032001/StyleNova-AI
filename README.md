@@ -12,7 +12,7 @@
 [![scikit-learn](https://img.shields.io/badge/scikit--learn-1.3+-F7931E?style=for-the-badge&logo=scikit-learn&logoColor=white)](https://scikit-learn.org)
 [![Next.js](https://img.shields.io/badge/Next.js-15-000000?style=for-the-badge&logo=next.js&logoColor=white)](https://nextjs.org)
 
-**A production-grade hybrid recommender that fuses OpenAI CLIP vision-language embeddings with adaptive collaborative filtering — deployed end-to-end with a real-time swipe feedback loop.**
+**A fashion recommender that fuses OpenAI CLIP vision-language embeddings with a per-user feedback loop — an image/brand/category query is embedded with CLIP, blended against a preference vector learned from each user's own likes and dislikes, and served through a FastAPI backend to a Next.js swipe interface (with a rule-based scorer as an offline fallback).**
 
 </div>
 
@@ -23,11 +23,10 @@
 | Dimension | What was built |
 |---|---|
 | **Computer Vision** | Zero-shot visual semantic matching via CLIP (ViT-B/32) cross-modal embeddings |
-| **ML System Design** | 3-component hybrid scorer with dynamically adaptive weighting |
-| **Online Learning** | Exponential moving average preference update on every user interaction |
-| **Exploration–Exploitation** | ε-greedy schedule with decaying randomness over session depth |
+| **ML System Design** | Priority-weighted CLIP query fusion (image > brand > category, falling back to quiz text) blended against a per-user preference vector |
+| **Online Learning** | Preference vector rebuilt from liked/disliked item embeddings after every swipe, with exponential time-decay on dislikes |
 | **Full-Stack Integration** | FastAPI ML backend ↔ Next.js 15 TypeScript frontend with Zod-validated contracts |
-| **Cold Start Strategy** | 6-dimensional preference quiz bootstraps embeddings before first swipe |
+| **Cold Start Strategy** | 6-question preference quiz (categories, colors, brands, styles, size, budget) bootstraps a query before first swipe |
 
 ---
 
@@ -56,103 +55,91 @@ Text Encoder (Transformer)        Image Encoder (ViT-B/32)
 
 ## Core ML Architecture
 
-### 1. Hybrid Recommendation Score
+> CLIP, PyTorch, and FastAPI provide the pretrained embedding model, tensor runtime, and serving framework. The query-fusion weighting, the feedback-driven preference vector and its decay math, and the exclusion rules below are what Brijesh designed and implemented on top of them.
 
-The final ranking score for any item is a weighted combination of three independent signals:
+### 1. Priority-Weighted CLIP Query Fusion
 
-$$\text{Score}(u, i) = \alpha \cdot S_{\text{content}}(u, i) \;+\; \beta \cdot S_{\text{collab}}(u, i) \;+\; \gamma \cdot S_{\text{visual}}(u, i)$$
-
-| Signal | Method | Description |
-|---|---|---|
-| $S_{\text{content}}$ | TF-IDF + cosine similarity | Catalog metadata: tags, colors, brand, category |
-| $S_{\text{collab}}$ | User-based kNN (scikit-learn) | Behavioral similarity across users |
-| $S_{\text{visual}}$ | CLIP ViT-B/32 cosine similarity | Cross-modal semantic embedding distance |
-
-### 2. Dynamic Weight Adaptation
-
-Weights shift automatically as a function of feedback density — solving the cold start problem without a hard rule switch:
+`AdaptiveFashionRecommender.get_priority_adaptive_recommendations` (`fashion-reco/adaptive_recommender.py`) builds one query embedding by combining whichever inputs are present, each CLIP-encoded and weighted by priority, then normalizes the result before scoring the catalog:
 
 ```python
-def calculate_adaptive_weights(feedback_count: int) -> tuple[float, float, float]:
-    if feedback_count < 5:
-        return (0.6, 0.2, 0.2)   # Cold start  — content-heavy, no behavioral signal yet
-    elif feedback_count < 20:
-        return (0.4, 0.4, 0.2)   # Warming up  — collaborative signal starts to form
-    else:
-        return (0.3, 0.5, 0.2)   # Engaged     — trust behavioral signal, keep visual anchor
+IMAGE_WEIGHT = 0.6      # highest priority — an uploaded/reference image
+BRAND_WEIGHT = 0.3      # medium priority — a brand name query
+CATEGORY_WEIGHT = 0.1   # lower priority — a category filter
+# quiz features are used as a fallback (weight 1.0) only when none of the above are present
+
+combined_embedding = (
+    IMAGE_WEIGHT * image_embedding
+    + BRAND_WEIGHT * brand_embedding
+    + CATEGORY_WEIGHT * category_embedding
+) / total_weight
+combined_embedding /= np.linalg.norm(combined_embedding)
+
+base_similarities = catalog_embeddings @ combined_embedding
 ```
 
-The visual weight ($\gamma = 0.2$) stays anchored throughout — CLIP embeddings provide a stable semantic prior that behavioral signals alone cannot replicate.
+This is a single-user query-fusion scheme, not collaborative filtering — there is no cross-user behavioral signal in the live serving path. (A separate, not-currently-wired module, `hybrid_recommender.py`, does use scikit-learn's `NearestNeighbors` for item-to-item visual similarity search over ResNet50 embeddings — see [Tech Stack](#tech-stack).)
 
-### 3. Online Preference Learning — Exponential Moving Average
+### 2. Feedback-Driven Preference Vector, with Temporal Decay
 
-Preferences update after every swipe, giving recent feedback higher weight without discarding history:
-
-$$\mathbf{P}_{t+1} = \lambda \cdot \mathbf{P}_{\text{feedback}} + (1 - \lambda) \cdot \mathbf{P}_{t}$$
-
-| Parameter | Value | Rationale |
-|---|---|---|
-| $\lambda$ (learning rate) | 0.3 | Prevents echo chambers while still adapting meaningfully |
-| Update frequency | Every interaction | Real-time — batch updates would feel unresponsive |
-| Preference vector | Per-attribute (color, style, category) | Fine-grained, not a single scalar |
-
-Too high a $\lambda$ collapses recommendations into a narrow band (echo chamber). Too low and the system feels static. $\lambda = 0.3$ was empirically validated across simulated user sessions.
-
-### 4. Exploration–Exploitation Trade-off
-
-A decaying ε-greedy schedule prevents over-exploiting early preferences:
-
-$$\text{Final Score} = (1 - \epsilon) \cdot \hat{S}(u,i) + \epsilon \cdot \text{Exploration Bonus}(i)$$
-
-- **Early session** (high ε): diversity injected, avoids locking into first impressions
-- **Late session** (low ε): exploitation dominates, high-confidence personalized results
-- ε decays as a function of cumulative feedback count — no per-user hyperparameter tuning required
-
-### 5. CLIP Embedding Engine
+Every like/dislike updates a per-user preference vector, which is then blended against the base query at request time via a client-supplied `adaptation_strength` (0–1):
 
 ```python
-import clip, torch, numpy as np
+positive_boost = 0.3      # weight applied to the mean of liked-item embeddings
+negative_penalty = -0.4   # base weight applied to disliked-item embeddings
+decay_rate = 0.1          # exponential decay applied per day since the dislike
+min_negative_weight = -0.1  # a dislike's influence never decays to zero
 
-class CLIPRecommender:
-    def __init__(self):
+decay_factor = exp(-decay_rate * days_since_feedback)
+weight = max(min_negative_weight, negative_penalty * decay_factor)
+
+preference_vector = positive_boost * mean(liked_embeddings) - mean(disliked_embeddings * |weight|)
+preference_vector /= np.linalg.norm(preference_vector)
+
+adapted_similarities = (1 - adaptation_strength) * base_similarities + adaptation_strength * (catalog_embeddings @ preference_vector)
+```
+
+On the frontend, `adaptationStrength` is itself increased as a session progresses (`Math.min(0.9, 0.5 + totalSwipes * 0.05)` in `SwipeDeck.tsx`), so later recommendations lean more heavily on the user's own feedback history.
+
+### 3. CLIP Embedding Engine
+
+```python
+# fashion-reco/clip_recommender.py — CLIPFashionRecommender
+class CLIPFashionRecommender:
+    def __init__(self, model_name: str = "ViT-B/32"):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # ViT-B/32: 12-layer Vision Transformer, 32×32 patch size, 512-dim output
-        self.model, self.preprocess = clip.load("ViT-B/32", device=self.device)
+        self.model, self.preprocess = clip.load(model_name, device=self.device)
 
-    def encode_text_query(self, description: str) -> np.ndarray:
-        tokens = clip.tokenize([description]).to(self.device)
+    def encode_text(self, text: str) -> np.ndarray:
+        tokens = clip.tokenize([text]).to(self.device)
         with torch.no_grad():
             features = self.model.encode_text(tokens)
-        # L2-normalize so cosine similarity reduces to a dot product
-        return (features / features.norm(dim=-1, keepdim=True)).cpu().numpy()
-
-    def similarity(self, query_emb: np.ndarray, catalog_embs: np.ndarray) -> np.ndarray:
-        # Batch cosine similarity: single matrix multiply after normalization
-        return (catalog_embs @ query_emb.T).squeeze()
+        features = features / features.norm(dim=-1, keepdim=True)
+        return features.cpu().numpy().flatten()
 ```
 
 **Key optimization decisions:**
-- Embeddings **pre-computed at catalog ingest** and cached as binary BLOBs in SQLite — inference cost paid once, not per query
+- Catalog embeddings are **computed once when the FastAPI service starts up** (`build_catalog_index`) and held in memory as a NumPy matrix for the life of the process — inference cost is paid once per process start, not per request
 - **CPU inference** for development portability; GPU swap is a single `device` change
 - **L2 normalization at encode time** so all similarity queries are pure dot-product batch ops
 
-### 6. Smart Exclusion — Soft Blacklist
+### 4. Client-Side Smart Exclusion
 
-Permanently excluding every passed item degrades recommendation diversity over time. Items are excluded only when genuinely unwanted:
+Permanently excluding every passed item degrades recommendation diversity over time, so exclusion is scoped to items the user has actively rejected. This logic lives in the Next.js swipe UI (`app/recommendations/components/SwipeDeck.tsx`), which computes the exclusion list before asking the backend for more recommendations:
 
-```python
-def smart_exclusion(passed_products: list[Product]) -> set[str]:
-    recent_passes = set(p.id for p in passed_products[-3:])   # recency window
-    dislike_counts = Counter(p.id for p in passed_products)
+```typescript
+const recentlyPassedIds = passedProducts.slice(-3).map(p => p.id)   // recency window
 
-    return {
-        p.id for p in passed_products
-        if dislike_counts[p.id] >= 2   # explicitly disliked multiple times
-        or p.id in recent_passes        # or seen very recently
-    }
+const dislikeCount = passedProducts.reduce((count, product) => {
+  count[product.id] = (count[product.id] || 0) + 1
+  return count
+}, {} as Record<string, number>)
+
+const excludeItemIds = passedProducts
+  .filter(p => dislikeCount[p.id] >= 2 || recentlyPassedIds.includes(p.id))
+  .map(p => p.id)
 ```
 
-Items passed once, long ago, naturally re-enter the pool — matching real browsing behavior.
+The exclusion list is sent to the backend as `exclude_items`; separately, the backend applies its own decaying score penalty (Section 2) to specific disliked items, so an old single pass naturally re-enters the pool as its penalty decays.
 
 ---
 
@@ -164,29 +151,33 @@ Items passed once, long ago, naturally re-enter the pool — matching real brows
 ├──────────────────────────────────┬────────────────────────────────────────────┤
 │   Next.js 15  (TypeScript)       │   FastAPI + Python  (ML Backend)           │
 │                                  │                                            │
-│  ┌─── Style Quiz (6 steps) ───┐  │  ┌─── /recommend ────────────────────┐    │
-│  │ categories · colors        │  │  │  1. Build preference vector        │    │
-│  │ brands · styles            │──┼─►│  2. CLIP text query encoding       │    │
-│  │ sizing · budget            │  │  │  3. Hybrid score (α·content        │    │
-│  └────────────────────────────┘  │  │     + β·collab + γ·visual)         │    │
-│                                  │  │  4. ε-greedy reranking             │    │
-│  ┌─── Swipe Interface ────────┐  │  │  5. Smart exclusion filter         │    │
-│  │  Like ──► POST /feedback   │──┼─►└───────────────────────────────────┘    │
-│  │  Pass ──► POST /feedback   │  │                                            │
-│  │  EMA weight update         │◄─┼──  Updated preference vector returned      │
+│  ┌─── Style Quiz (6 steps) ───┐  │  ┌─── /recommend/adaptive ───────────┐    │
+│  │ categories · colors        │  │  │  1. Encode image/brand/category    │    │
+│  │ brands · styles            │──┼─►│     (or quiz text) with CLIP       │    │
+│  │ sizing · budget            │  │  │  2. Priority-weighted query fusion │    │
+│  └────────────────────────────┘  │  │  3. Blend with user preference     │    │
+│                                  │  │     vector (adaptation_strength)   │    │
+│  ┌─── Swipe Interface ────────┐  │  │  4. Filter client-supplied         │    │
+│  │  Like ──► POST /feedback   │──┼─►│     exclude_items                  │    │
+│  │  Pass ──► POST /feedback   │  │  └───────────────────────────────────┘    │
+│  │  Client-side smart         │◄─┼──  Ranked recommendations returned         │
+│  │  exclusion (recency +      │  │                                            │
+│  │  dislike-count rules)      │  │                                            │
 │  └────────────────────────────┘  │                                            │
-│                                  │  ┌─── Embedding Store ───────────────┐    │
+│                                  │  ┌─── Catalog + Embeddings ──────────┐    │
 │  ┌─── Zustand Store ──────────┐  │  │  catalog.csv → CLIP ViT-B/32      │    │
-│  │  quiz answers              │  │  │  512-dim vectors → SQLite BLOBs   │    │
-│  │  session feedback history  │  │  │  Pre-computed at catalog ingest    │    │
-│  │  current recommendations   │  │  └───────────────────────────────────┘    │
-│  └────────────────────────────┘  │                                            │
+│  │  quiz answers              │  │  │  512-dim vectors held in-memory   │    │
+│  │  session feedback history  │  │  │  (NumPy matrix), computed once    │    │
+│  │  current recommendations   │  │  │  at FastAPI process startup       │    │
+│  └────────────────────────────┘  │  └───────────────────────────────────┘    │
 └──────────────────────────────────┴────────────────────────────────────────────┘
-                        │                          │
-               ┌────────▼──────────────────────────▼────────┐
-               │          Prisma ORM  ·  SQLite              │
-               │   Users · Products · Feedback · Embeddings  │
-               └─────────────────────────────────────────────┘
+                        │
+               ┌────────▼────────────────────────────────────┐
+               │          Prisma ORM  ·  SQLite               │
+               │   Users · Quizzes · Feedback · Recommendation │
+               │   (separate from the Python service's         │
+               │    in-memory catalog/embeddings above)         │
+               └────────────────────────────────────────────────┘
 ```
 
 ---
@@ -205,31 +196,6 @@ Items passed once, long ago, naturally re-enter the pool — matching real brows
 
 ---
 
-## Performance Results
-
-### Recommendation Quality
-| Metric | Score | Notes |
-|---|---|---|
-| Precision@10 | **0.73** | 73% of top-10 recommendations rated relevant |
-| Diversity Score | **0.68** | Intra-list diversity — avoids redundant results |
-| Catalog Coverage | **89%** | Items surfaced to ≥1 user — avoids popularity bias |
-
-### User Engagement
-| Metric | Value |
-|---|---|
-| Quiz Completion Rate | **84%** |
-| Avg. Session Duration | **3.2 min** |
-| Swipe-through Rate | **67%** swipe ≥10 items |
-
-### System Performance
-| Metric | Value |
-|---|---|
-| API Response Time | **< 200 ms** (cached embeddings) |
-| Frontend Bundle | **2.3 MB** gzipped |
-| DB Query Time | **< 50 ms** |
-
----
-
 ## Tech Stack
 
 ### ML / Backend
@@ -237,7 +203,7 @@ Items passed once, long ago, naturally re-enter the pool — matching real brows
 |---|---|
 | **OpenAI CLIP** (ViT-B/32) | Vision-language embedding, zero-shot visual retrieval |
 | **PyTorch 2.0+** | CLIP inference, tensor operations, GPU/CPU abstraction |
-| **scikit-learn** | kNN collaborative filtering, cosine similarity at scale |
+| **scikit-learn** | `NearestNeighbors` item-to-item similarity search over ResNet50 embeddings (`hybrid_recommender.py` / `indexing/sklearn_index.py`) — a separate exploratory module, not the CLIP path the live API serves |
 | **NumPy / Pandas** | Embedding arithmetic, catalog preprocessing |
 | **FastAPI** | Async REST endpoints with automatic OpenAPI documentation |
 | **Pydantic** | Runtime data validation, type-safe request/response models |
@@ -256,33 +222,41 @@ Items passed once, long ago, naturally re-enter the pool — matching real brows
 
 ## Database Schema
 
+The Next.js app persists quiz and feedback data through Prisma to SQLite. The actual models (`prisma/schema.prisma`):
+
 ```sql
-CREATE TABLE products (
-    id             TEXT PRIMARY KEY,
-    brand          TEXT,
-    category       TEXT,
-    colors         JSON,
-    price          REAL,
-    tags           JSON,
-    image_url      TEXT,
-    clip_embedding BLOB    -- 512-dim float32 vector, pre-computed via ViT-B/32
+CREATE TABLE "User" (
+    "id"        TEXT PRIMARY KEY,
+    "email"     TEXT NOT NULL UNIQUE,
+    "createdAt" DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE feedback (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    TEXT,
-    product_id TEXT,
-    action     TEXT,       -- 'like' | 'pass'
-    score      REAL,       -- recommendation score at time of interaction
-    timestamp  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE "Quiz" (
+    "id"        TEXT PRIMARY KEY,
+    "userId"    TEXT NOT NULL REFERENCES "User"("id"),
+    "answers"   TEXT NOT NULL,   -- JSON-encoded QuizAnswer[]
+    "completed" BOOLEAN DEFAULT false,
+    "createdAt" DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE users (
-    id          TEXT PRIMARY KEY,
-    preferences JSON,      -- EMA-updated preference vector per session
-    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE "Recommendation" (
+    "id"        TEXT PRIMARY KEY,
+    "quizId"    TEXT NOT NULL,
+    "items"     TEXT NOT NULL,   -- JSON-encoded top-N catalog subset with scores
+    "createdAt" DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE "Feedback" (
+    "id"        TEXT PRIMARY KEY,
+    "userId"    TEXT NOT NULL REFERENCES "User"("id"),
+    "productId" TEXT NOT NULL,
+    "action"    TEXT NOT NULL,   -- 'like' | 'pass'
+    "score"     INTEGER,
+    "createdAt" DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 ```
+
+The product catalog itself is a static TypeScript array (`lib/catalog.ts`) on the frontend and a separate CSV (`fashion-reco/catalog.csv`) loaded into memory by the Python service — neither the catalog nor CLIP embeddings are stored in this SQLite database.
 
 ---
 
@@ -299,7 +273,9 @@ cd stylenova-ai
 
 npm install
 
-# Push Prisma schema and seed the product catalog
+# Push the Prisma schema and seed a demo user
+# (the product catalog itself ships as a static array in lib/catalog.ts,
+#  not as Prisma-seeded data)
 npm run db:push
 npm run db:seed
 
@@ -318,9 +294,10 @@ source fashion_venv/bin/activate        # Windows: fashion_venv\Scripts\activate
 
 pip install -r requirements.txt
 
-# Start FastAPI with hot reload
-uvicorn adaptive_api:app --reload --port 8000
-# → http://localhost:8000/docs  (auto-generated OpenAPI UI)
+# Start FastAPI with hot reload — must be port 8004, since the frontend
+# (lib/fashion-api.ts) calls http://localhost:8004
+uvicorn adaptive_api:app --reload --port 8004
+# → http://localhost:8004/docs  (auto-generated OpenAPI UI)
 ```
 
 ---
@@ -329,29 +306,29 @@ uvicorn adaptive_api:app --reload --port 8000
 
 ```
 stylenova-ai/
-├── fashion-reco/                   # ◄ ML backend
-│   ├── adaptive_api.py             #   FastAPI entrypoint
-│   ├── adaptive_recommender.py     #   Core hybrid scoring + EMA updates
+├── fashion-reco/                   # ◄ ML backend (live path: adaptive_api.py)
+│   ├── adaptive_api.py             #   FastAPI entrypoint (serves on :8004)
+│   ├── adaptive_recommender.py     #   Priority query fusion + preference-vector updates
 │   ├── clip_recommender.py         #   CLIP ViT-B/32 embedding engine
-│   ├── hybrid_recommender.py       #   Score combination + reranking
+│   ├── hybrid_recommender.py       #   Separate ResNet50 + sklearn exploration (not wired to adaptive_api.py)
 │   ├── catalog.csv                 #   Fashion product catalog
 │   ├── requirements.txt
 │   └── indexing/
-│       └── sklearn_index.py        #   scikit-learn kNN index
+│       └── sklearn_index.py        #   scikit-learn kNN index (used by hybrid_recommender.py)
 ├── app/
 │   ├── quiz/                       #   6-step preference quiz
-│   ├── recommendations/            #   Swipe card interface
+│   ├── recommendations/            #   Swipe card interface + client-side smart exclusion
 │   └── api/
-│       ├── quiz/                   #   Quiz submission → backend call
-│       └── feedback/               #   Like/pass → EMA update
+│       ├── quiz/                   #   Quiz submission → Prisma
+│       └── feedback/               #   Like/pass → Prisma (separate from the Python backend's own feedback loop)
 ├── lib/
-│   ├── fashion-api.ts              #   Typed backend client
+│   ├── fashion-api.ts              #   Typed client for the Python CLIP backend
 │   ├── store.ts                    #   Zustand session store
-│   ├── scoring.ts                  #   Client-side scoring utilities
+│   ├── scoring.ts                  #   Rule-based fallback scorer (used when the Python backend is unreachable)
 │   └── validators.ts               #   Zod schemas
 └── prisma/
     ├── schema.prisma
-    └── seed.ts                     #   Catalog ingest + embedding precompute
+    └── seed.ts                     #   Seeds a demo user (catalog is not seeded into this DB — see lib/catalog.ts)
 ```
 
 ---
@@ -361,10 +338,9 @@ stylenova-ai/
 | Decision | Alternatives Considered | Why This Choice |
 |---|---|---|
 | CLIP ViT-B/32 over text-only TF-IDF | ResNet, EfficientNet, pure TF-IDF | Cross-modal: text queries → visual results without image uploads |
-| EMA over gradient descent updates | SGD on preference vector | No labels needed; works from binary like/pass signals only |
-| Pre-computed embeddings in SQLite | On-the-fly CLIP inference at query time | < 200ms response vs ~2s per query cold inference |
-| ε-greedy over Thompson Sampling | UCB, full Bayesian bandits | Simpler, interpretable, sufficient for session-length horizons |
-| Soft exclusion over hard blacklist | Remove all passed items permanently | Preserves catalog diversity; matches real browsing behavior |
+| Boost/decay preference vector over gradient descent | SGD on a learned preference vector | No labels needed; works from binary like/dislike signals only |
+| Catalog embeddings computed once at process startup, held in memory | On-the-fly CLIP inference at query time | Avoids re-running CLIP inference on every request |
+| Soft exclusion (recency + dislike-count rules) over hard blacklist | Remove all passed items permanently | Preserves catalog diversity; matches real browsing behavior |
 
 ---
 
@@ -373,11 +349,11 @@ stylenova-ai/
 | Challenge | Solution |
 |---|---|
 | **Inconsistent catalog data** — sparse tags on many items | Pydantic validation + CLIP bridges gaps text tags cannot fill |
-| **CLIP memory overhead** | Pre-computed 512-dim BLOBs; inference cost amortized at ingest |
-| **ML adaptation invisible to users** | Color preference toggle every 3rd call — live visible proof of learning |
-| **Cold start before any feedback** | 6-dimensional quiz bootstraps a preference vector from zero |
+| **CLIP memory overhead** | Catalog embeddings computed once and held in memory as a NumPy matrix; inference cost amortized across the process lifetime |
+| **ML adaptation invisible to users** | Swipe UI re-fetches recommendations every 3rd swipe and surfaces an "AI adapted" badge — visible proof of learning |
+| **Cold start before any feedback** | 6-question quiz bootstraps a CLIP query before any swipe feedback exists |
 | **Type contract drift** between TS frontend and Python backend | Zod schemas mirror Pydantic models; validated at both boundaries |
-| **Recommendation staleness after many passes** | Soft exclusion with recency window; hard blacklist only after 2+ explicit passes |
+| **Recommendation staleness after many passes** | Soft exclusion with a recency window; a hard exclude only after 2+ explicit passes |
 
 ---
 
@@ -385,11 +361,8 @@ stylenova-ai/
 
 | Decision | Constraint | Result |
 |---|---|---|
-| **Optimistic swipe updates** | Swipe feedback needs to feel instant even though reranking takes real compute | Zustand removes the swiped card immediately while FastAPI recomputes preference weights asynchronously, with rollback on failure, cutting perceived interaction latency from approximately 450 ms to under 100 ms |
-| **Indexed preference history** | EMA updates need fast recent-history lookups as feedback grows | SwipeEvent, PreferenceVector, and QuizResponse are modeled as indexed Prisma tables, keeping recent-swipe queries under approximately 35 ms for 1,000 events per user |
-| **Velocity-based swipe gestures** | Fashion discovery should feel physical, not like button clicking | Framer Motion fling detection commits high-velocity swipes even below the distance threshold, tuned against roughly 75 manual test swipes for natural gesture speed |
-| **Recommendation explanations** | A similarity score alone does not tell users why an item was recommended | GPT-4o-mini generates a short natural-language explanation from recent swipe patterns and item attributes, adding under approximately 250 ms latency per explanation |
-| **LLM-guided preference correction** | Swiping alone is slow when the recommendation cluster is clearly wrong | GPT-4o-mini function calling exposes `adjust_preference_weights`, letting feedback like "less formal, brighter colors" update weighting directly and reducing correction effort from roughly 12 swipes to 4 |
+| **Optimistic swipe updates** | Swipe feedback needs to feel instant even though the backend call takes real network + compute time | The Zustand store advances to the next card immediately (`swipeProduct`) while the like/dislike is submitted to the FastAPI backend and to the Next.js `/api/feedback` route in the background; if the backend call fails, the local swipe is not rolled back — the UI stays responsive at the cost of that one interaction not reaching the adaptive backend |
+| **Velocity-based swipe gestures** | Fashion discovery should feel physical, not like button clicking | Framer Motion's drag handler commits a swipe when either the drag distance exceeds 50px or the release velocity exceeds 300px/s — so a fast flick commits even under the distance threshold |
 
 ---
 
